@@ -1,10 +1,12 @@
 """
 Discord-бот для отслеживания "Гунов" (Goon Squad) в Escape from Tarkov.
 
-Парсит три сайта:
+Парсит два сайта:
 1. https://www.tarkov-goon-tracker.com/pve
 2. https://www.goon-tracker.com/pvetracker
-3. https://eft.su/goons
+
+Оба сайта помечают время своих записей таймзоной (первый — "z"/UTC,
+второй — "PST"), поэтому бот конвертирует их во время МСК (UTC+3).
 
 Команда в Discord: !гуны
 
@@ -12,7 +14,7 @@ Discord-бот для отслеживания "Гунов" (Goon Squad) в Esca
     pip install -r requirements.txt
 
 Запуск:
-    export DISCORD_TOKEN="твой_токен_бота"   (Windows: set DISCORD_TOKEN=...)
+    export DISCORD_TOKEN="твой_токен_бота"   (Windows PowerShell: $env:DISCORD_TOKEN="...")
     python goon_bot.py
 """
 
@@ -20,6 +22,7 @@ import os
 import re
 import logging
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import discord
@@ -40,8 +43,16 @@ HEADERS = {
 URLS = {
     "tarkov_goon_tracker": "https://www.tarkov-goon-tracker.com/pve",
     "goon_tracker": "https://www.goon-tracker.com/pvetracker",
-    "eft_su": "https://eft.su/goons",
 }
+
+MSK = timezone(timedelta(hours=3), name="MSK")
+UTC = timezone.utc
+PST = timezone(timedelta(hours=-8), name="PST")  # сайт goon-tracker.com жёстко подписывает время как PST
+
+
+def to_msk_str(dt: datetime) -> str:
+    """Форматирует datetime (с уже выставленным tzinfo) как строку в МСК."""
+    return dt.astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
 
 
 # ---------------------------------------------------------------------------
@@ -67,37 +78,48 @@ async def fetch_html(session: aiohttp.ClientSession, url: str) -> str | None:
 def parse_tarkov_goon_tracker(html: str) -> dict:
     """
     https://www.tarkov-goon-tracker.com/pve
-    Ищем фразу "The Goons were last seen on: <Карта>",
-    и первую строку таблицы "Recent Goon Trackings" как доп. подтверждение.
+
+    Берём первую строку таблицы "Recent Goon Trackings":
+    Map | Time | Tracker | Logged In
+    Время в столбце "Time" отмечено суффиксом "z" (Zulu / UTC),
+    например: "Aug 07, 2026 10:49 AM z".
     """
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
 
     map_name = None
-    m = re.search(r"last seen on:?\s*([A-Za-z]+)", text, re.IGNORECASE)
-    if m:
-        map_name = m.group(1).strip()
-
-    time_str = None
+    time_msk = None
     reporter = None
+
     table = soup.find("table")
     if table:
         rows = table.find_all("tr")
-        # первая строка обычно заголовок, вторая - первая запись
         if len(rows) > 1:
-            cells = rows[1].find_all(["td", "th"])
-            cell_texts = [c.get_text(strip=True) for c in cells]
-            if len(cell_texts) >= 1 and not map_name:
-                map_name = cell_texts[0]
-            if len(cell_texts) >= 2:
-                time_str = cell_texts[1]
-            if len(cell_texts) >= 3:
-                reporter = cell_texts[2]
+            cells = [c.get_text(strip=True) for c in rows[1].find_all(["td", "th"])]
+            if len(cells) >= 1:
+                map_name = cells[0]
+            if len(cells) >= 2:
+                raw_time = cells[1]
+                m = re.match(r"([A-Za-z]{3} \d{1,2}, \d{4} \d{1,2}:\d{2} [AP]M)\s*z?", raw_time, re.IGNORECASE)
+                if m:
+                    try:
+                        dt = datetime.strptime(m.group(1), "%b %d, %Y %I:%M %p").replace(tzinfo=UTC)
+                        time_msk = to_msk_str(dt)
+                    except ValueError:
+                        pass
+            if len(cells) >= 3:
+                reporter = cells[2]
+
+    # Фолбэк на заголовочную фразу, если таблицу не удалось распарсить
+    if not map_name:
+        text = soup.get_text(" ", strip=True)
+        m = re.search(r"last seen on:?\s*([A-Za-z]+)", text, re.IGNORECASE)
+        if m:
+            map_name = m.group(1).strip()
 
     return {
         "source": "Tarkov Goon Tracker (PvE)",
         "map": map_name,
-        "time": time_str,
+        "time_msk": time_msk,
         "extra": f"Репортер: {reporter}" if reporter else None,
         "url": URLS["tarkov_goon_tracker"],
     }
@@ -106,17 +128,18 @@ def parse_tarkov_goon_tracker(html: str) -> dict:
 def parse_goon_tracker(html: str) -> dict:
     """
     https://www.goon-tracker.com/pvetracker
+
     Блок:
         Last Seen on PvE Mode:
         <Карта>
-        Time: <дата/время>
-        Last seen: <относительное время>
+        Time: 2026-08-07 07:51:00 PST
+        Last seen: 5 minutes ago
     """
     soup = BeautifulSoup(html, "html.parser")
     lines = [l.strip() for l in soup.get_text("\n", strip=True).split("\n") if l.strip()]
 
     map_name = None
-    time_str = None
+    time_msk = None
     relative = None
 
     for i, line in enumerate(lines):
@@ -124,7 +147,14 @@ def parse_goon_tracker(html: str) -> dict:
             if i + 1 < len(lines):
                 map_name = lines[i + 1]
             if i + 2 < len(lines) and lines[i + 2].lower().startswith("time:"):
-                time_str = lines[i + 2].split(":", 1)[1].strip()
+                raw_time = lines[i + 2].split(":", 1)[1].strip()
+                m = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*PST", raw_time, re.IGNORECASE)
+                if m:
+                    try:
+                        dt = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=PST)
+                        time_msk = to_msk_str(dt)
+                    except ValueError:
+                        pass
             if i + 3 < len(lines) and lines[i + 3].lower().startswith("last seen:"):
                 relative = lines[i + 3].split(":", 1)[1].strip()
             break
@@ -132,41 +162,9 @@ def parse_goon_tracker(html: str) -> dict:
     return {
         "source": "Goon-Tracker.com (PvE)",
         "map": map_name,
-        "time": time_str,
-        "extra": f"Когда: {relative}" if relative else None,
+        "time_msk": time_msk,
+        "extra": f"({relative})" if relative else None,
         "url": URLS["goon_tracker"],
-    }
-
-
-def parse_eft_su(html: str) -> dict:
-    """
-    https://eft.su/goons
-    Сайт показывает отдельно последнее появление в PVP и в PVE.
-    Нам нужен только PVE-блок. Ссылки на карту вида <a href="/m/lighthouse">...</a>.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    map_name = None
-    time_str = None
-
-    for a in soup.find_all("a", href=re.compile(r"^/m/")):
-        text = a.get_text(" ", strip=True)
-        if "PVE" not in text.upper():
-            continue
-
-        slug = a["href"].rsplit("/m/", 1)[-1]
-        map_name = slug.replace("-", " ").title()
-
-        date_match = re.search(r"(\d{1,2}\s+\S+\.?,?\s+\d{2}:\d{2})", text)
-        time_str = date_match.group(1) if date_match else None
-        break  # берём первое совпадение (PVE-блок идёт один раз на странице)
-
-    return {
-        "source": "EFT.SU (PvE)",
-        "map": map_name,
-        "time": time_str,
-        "extra": None,
-        "url": URLS["eft_su"],
     }
 
 
@@ -185,12 +183,14 @@ async def on_ready():
     log.info("Бот запущен как %s", bot.user)
 
 
-def fmt_field(map_name, time_str, extra=None):
+def fmt_field(map_name, time_msk, extra=None):
     if not map_name:
         return "⚠️ Не удалось распарсить данные (возможно, изменилась разметка сайта)"
     value = f"Карта: **{map_name}**"
-    if time_str:
-        value += f"\nВремя: {time_str}"
+    if time_msk:
+        value += f"\nПоследний раз видели: **{time_msk}**"
+    else:
+        value += "\nВремя: не удалось определить"
     if extra:
         value += f"\n{extra}"
     return value
@@ -199,13 +199,12 @@ def fmt_field(map_name, time_str, extra=None):
 @bot.command(name="гуны")
 @commands.cooldown(1, 15, commands.BucketType.guild)  # не чаще раза в 15 сек на сервер, чтобы не спамить сайты
 async def goons(ctx: commands.Context):
-    """Показывает последние замеченные локации Гунов с трёх трекеров."""
+    """Показывает последние замеченные локации Гунов (PvE) с двух трекеров, время в МСК."""
     async with ctx.typing():
         async with aiohttp.ClientSession() as session:
-            html_tgt, html_gt, html_eft = await asyncio.gather(
+            html_tgt, html_gt = await asyncio.gather(
                 fetch_html(session, URLS["tarkov_goon_tracker"]),
                 fetch_html(session, URLS["goon_tracker"]),
-                fetch_html(session, URLS["eft_su"]),
             )
 
         embed = discord.Embed(
@@ -218,7 +217,7 @@ async def goons(ctx: commands.Context):
             d = parse_tarkov_goon_tracker(html_tgt)
             embed.add_field(
                 name=f"📍 {d['source']}",
-                value=fmt_field(d["map"], d["time"], d["extra"]),
+                value=fmt_field(d["map"], d["time_msk"], d["extra"]),
                 inline=False,
             )
         else:
@@ -229,22 +228,11 @@ async def goons(ctx: commands.Context):
             d = parse_goon_tracker(html_gt)
             embed.add_field(
                 name=f"📍 {d['source']}",
-                value=fmt_field(d["map"], d["time"], d["extra"]),
+                value=fmt_field(d["map"], d["time_msk"], d["extra"]),
                 inline=False,
             )
         else:
             embed.add_field(name="📍 Goon-Tracker.com (PvE)", value="⚠️ Сайт недоступен", inline=False)
-
-        # 3. eft.su
-        if html_eft:
-            d = parse_eft_su(html_eft)
-            embed.add_field(
-                name=f"📍 {d['source']}",
-                value=fmt_field(d["map"], d["time"], d["extra"]),
-                inline=False,
-            )
-        else:
-            embed.add_field(name="📍 EFT.SU (PvE)", value="⚠️ Сайт недоступен", inline=False)
 
         embed.set_footer(text="Данные собраны с публичных коммьюнити-трекеров, могут не совпадать между источниками")
 
