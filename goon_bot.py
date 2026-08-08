@@ -136,28 +136,35 @@ def parse_goon_tracker(html: str) -> dict:
         Last seen: 5 minutes ago
     """
     soup = BeautifulSoup(html, "html.parser")
-    lines = [l.strip() for l in soup.get_text("\n", strip=True).split("\n") if l.strip()]
+    # Флэттеним весь текст страницы через пробел. Это надёжнее, чем резать по
+    # номерам строк: если "Time:" и сама дата лежат в разных HTML-тегах, номера
+    # строк "плывут", а склеенный через пробел текст сохраняет порядок и рядом
+    # стоящие подписи/значения всё равно оказываются друг рядом с другом.
+    text = soup.get_text(" ", strip=True)
 
     map_name = None
     time_msk = None
     relative = None
 
-    for i, line in enumerate(lines):
-        if "Last Seen on PvE Mode" in line:
-            if i + 1 < len(lines):
-                map_name = lines[i + 1]
-            if i + 2 < len(lines) and lines[i + 2].lower().startswith("time:"):
-                raw_time = lines[i + 2].split(":", 1)[1].strip()
-                m = re.match(r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*PST", raw_time, re.IGNORECASE)
-                if m:
-                    try:
-                        dt = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=PST)
-                        time_msk = to_msk_str(dt)
-                    except ValueError:
-                        pass
-            if i + 3 < len(lines) and lines[i + 3].lower().startswith("last seen:"):
-                relative = lines[i + 3].split(":", 1)[1].strip()
-            break
+    map_match = re.search(r"Last Seen on PvE Mode:\s*([A-Za-z]+)", text, re.IGNORECASE)
+    if map_match:
+        map_name = map_match.group(1)
+
+    time_match = re.search(
+        r"Time:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*PST",
+        text,
+        re.IGNORECASE,
+    )
+    if time_match:
+        try:
+            dt = datetime.strptime(time_match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=PST)
+            time_msk = to_msk_str(dt)
+        except ValueError:
+            pass
+
+    relative_match = re.search(r"Last seen:\s*([\w\s]+?ago)", text, re.IGNORECASE)
+    if relative_match:
+        relative = relative_match.group(1).strip()
 
     return {
         "source": "Goon-Tracker.com (PvE)",
