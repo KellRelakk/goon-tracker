@@ -188,7 +188,6 @@ def parse_tarkov_goon_tracker(html: str) -> dict:
 
     map_name = None
     time_msk = None
-    reporter = None
     relative = None
 
     table = soup.find("table")
@@ -208,8 +207,6 @@ def parse_tarkov_goon_tracker(html: str) -> dict:
                         relative = humanize_ago(dt)
                     except ValueError:
                         pass
-            if len(cells) >= 3:
-                reporter = cells[2]
 
     # Фолбэк на заголовочную фразу, если таблицу не удалось распарсить
     if not map_name:
@@ -218,17 +215,11 @@ def parse_tarkov_goon_tracker(html: str) -> dict:
         if m:
             map_name = m.group(1).strip()
 
-    extra_parts = []
-    if reporter:
-        extra_parts.append(f"Репортер: {reporter}")
-    if relative:
-        extra_parts.append(relative)
-
     return {
         "source": "Tarkov Goon Tracker (PvE)",
         "map": translate_map(map_name),
         "time_msk": time_msk,
-        "extra": "\n".join(extra_parts) if extra_parts else None,
+        "extra": relative,
         "url": URLS["tarkov_goon_tracker"],
     }
 
@@ -303,36 +294,28 @@ def parse_tarkovbot_eu(html: str) -> dict:
     section = section_match.group(1) if section_match else text
 
     map_name = None
-    reporter = None
     time_msk = None
     relative = None
 
     m = re.search(
         r"([A-Za-z]+)\s*\(PVE\)\s*\d{2}\.\d{2}\.\d{4}\s*\d{2}:\d{2}:\d{2}\s*"
-        r"Reported by\s*(\S+)\s*((?:\d+\s+\w+\s+ago)|just now)",
+        r"Reported by\s*\S+\s*((?:\d+\s+\w+\s+ago)|just now)",
         section,
         re.IGNORECASE,
     )
     if m:
         map_name = m.group(1)
-        reporter = m.group(2)
-        delta = parse_relative_ago(m.group(3))
+        delta = parse_relative_ago(m.group(2))
         if delta is not None:
             dt = datetime.now(UTC) - delta
             time_msk = to_msk_str(dt)
             relative = humanize_ago(dt)
 
-    extra_parts = []
-    if reporter:
-        extra_parts.append(f"Репортер: {reporter}")
-    if relative:
-        extra_parts.append(relative)
-
     return {
         "source": "TarkovBOT.eu (PvE)",
         "map": translate_map(map_name),
         "time_msk": time_msk,
-        "extra": "\n".join(extra_parts) if extra_parts else None,
+        "extra": relative,
         "url": URLS["tarkovbot_eu"],
     }
 
