@@ -49,6 +49,20 @@ MSK = timezone(timedelta(hours=3), name="MSK")
 UTC = timezone.utc
 PST = timezone(timedelta(hours=-8), name="PST")  # сайт goon-tracker.com жёстко подписывает время как PST
 
+MAP_NAMES_RU = {
+    "customs": "Таможня",
+    "shoreline": "Берег",
+    "woods": "Лес",
+    "lighthouse": "Маяк",
+}
+
+
+def translate_map(map_name: str | None) -> str | None:
+    """Переводит название карты на русский, если оно известно; иначе возвращает как есть."""
+    if not map_name:
+        return map_name
+    return MAP_NAMES_RU.get(map_name.strip().lower(), map_name)
+
 
 def to_msk_str(dt: datetime) -> str:
     """Форматирует datetime (с уже выставленным tzinfo) как строку в МСК."""
@@ -144,7 +158,7 @@ def parse_tarkov_goon_tracker(html: str) -> dict:
 
     return {
         "source": "Tarkov Goon Tracker (PvE)",
-        "map": map_name,
+        "map": translate_map(map_name),
         "time_msk": time_msk,
         "extra": "\n".join(extra_parts) if extra_parts else None,
         "url": URLS["tarkov_goon_tracker"],
@@ -169,13 +183,13 @@ def parse_goon_tracker(html: str) -> dict:
     text = soup.get_text(" ", strip=True)
 
     map_name = None
-    time_msk = None
-    relative = None
 
     map_match = re.search(r"Last Seen on PvE Mode:\s*([A-Za-z]+)", text, re.IGNORECASE)
     if map_match:
         map_name = map_match.group(1)
 
+    time_msk = None
+    dt = None
     time_match = re.search(
         r"Time:\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*PST",
         text,
@@ -186,17 +200,15 @@ def parse_goon_tracker(html: str) -> dict:
             dt = datetime.strptime(time_match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=PST)
             time_msk = to_msk_str(dt)
         except ValueError:
-            pass
+            dt = None
 
-    relative_match = re.search(r"Last seen:\s*([\w\s]+?ago)", text, re.IGNORECASE)
-    if relative_match:
-        relative = relative_match.group(1).strip()
+    relative = humanize_ago(dt) if dt else None
 
     return {
         "source": "Goon-Tracker.com (PvE)",
-        "map": map_name,
+        "map": translate_map(map_name),
         "time_msk": time_msk,
-        "extra": f"({relative})" if relative else None,
+        "extra": relative,
         "url": URLS["goon_tracker"],
     }
 
