@@ -189,6 +189,7 @@ def parse_tarkov_goon_tracker(html: str) -> dict:
     map_name = None
     time_msk = None
     relative = None
+    dt_utc = None
 
     table = soup.find("table")
     if table:
@@ -205,6 +206,7 @@ def parse_tarkov_goon_tracker(html: str) -> dict:
                         dt = datetime.strptime(m.group(1), "%b %d, %Y %I:%M %p").replace(tzinfo=UTC)
                         time_msk = to_msk_str(dt)
                         relative = humanize_ago(dt)
+                        dt_utc = dt.astimezone(UTC)
                     except ValueError:
                         pass
 
@@ -220,6 +222,7 @@ def parse_tarkov_goon_tracker(html: str) -> dict:
         "map": translate_map(map_name),
         "time_msk": time_msk,
         "extra": relative,
+        "dt_utc": dt_utc,
         "url": URLS["tarkov_goon_tracker"],
     }
 
@@ -262,12 +265,14 @@ def parse_goon_tracker(html: str) -> dict:
             dt = None
 
     relative = humanize_ago(dt) if dt else None
+    dt_utc = dt.astimezone(UTC) if dt else None
 
     return {
         "source": "Goon-Tracker.com (PvE)",
         "map": translate_map(map_name),
         "time_msk": time_msk,
         "extra": relative,
+        "dt_utc": dt_utc,
         "url": URLS["goon_tracker"],
     }
 
@@ -296,6 +301,7 @@ def parse_tarkovbot_eu(html: str) -> dict:
     map_name = None
     time_msk = None
     relative = None
+    dt_utc = None
 
     m = re.search(
         r"([A-Za-z]+)\s*\(PVE\)\s*\d{2}\.\d{2}\.\d{4}\s*\d{2}:\d{2}:\d{2}\s*"
@@ -310,12 +316,14 @@ def parse_tarkovbot_eu(html: str) -> dict:
             dt = datetime.now(UTC) - delta
             time_msk = to_msk_str(dt)
             relative = humanize_ago(dt)
+            dt_utc = dt
 
     return {
         "source": "TarkovBOT.eu (PvE)",
         "map": translate_map(map_name),
         "time_msk": time_msk,
         "extra": relative,
+        "dt_utc": dt_utc,
         "url": URLS["tarkovbot_eu"],
     }
 
@@ -334,6 +342,7 @@ def parse_eft_su(html: str) -> dict:
     map_name = None
     time_msk = None
     relative = None
+    dt_utc = None
 
     for a in soup.find_all("a", href=re.compile(r"/m/[a-z\-]+", re.IGNORECASE)):
         text = a.get_text(" ", strip=True)
@@ -350,6 +359,7 @@ def parse_eft_su(html: str) -> dict:
             if dt:
                 time_msk = to_msk_str(dt)
                 relative = humanize_ago(dt)
+                dt_utc = dt.astimezone(UTC)
         break
 
     return {
@@ -357,6 +367,7 @@ def parse_eft_su(html: str) -> dict:
         "map": translate_map(map_name),
         "time_msk": time_msk,
         "extra": relative,
+        "dt_utc": dt_utc,
         "url": URLS["eft_su"],
     }
 
@@ -414,16 +425,27 @@ async def goons(ctx: commands.Context):
             (html_eft, parse_eft_su, "EFT.SU (PvE)"),
         ]
 
+        entries = []
         for html, parser, fallback_name in sources:
             if html:
                 d = parser(html)
-                embed.add_field(
-                    name=f"📍 {d['source']}",
-                    value=fmt_field(d["map"], d["time_msk"], d["extra"]),
-                    inline=False,
-                )
+                entries.append({
+                    "name": f"📍 {d['source']}",
+                    "value": fmt_field(d["map"], d["time_msk"], d["extra"]),
+                    "dt_utc": d.get("dt_utc"),
+                })
             else:
-                embed.add_field(name=f"📍 {fallback_name}", value="⚠️ Сайт недоступен", inline=False)
+                entries.append({
+                    "name": f"📍 {fallback_name}",
+                    "value": "⚠️ Сайт недоступен",
+                    "dt_utc": None,
+                })
+
+        # Самый свежий репорт — сверху, у кого не распарсилось время — в самом низу.
+        entries.sort(key=lambda e: (e["dt_utc"] is None, -(e["dt_utc"].timestamp() if e["dt_utc"] else 0)))
+
+        for e in entries:
+            embed.add_field(name=e["name"], value=e["value"], inline=False)
 
         embed.set_footer(text="Данные собраны с публичных коммьюнити-трекеров, могут не совпадать между источниками")
 
