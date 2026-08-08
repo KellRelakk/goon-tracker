@@ -1,12 +1,21 @@
 """
 Discord-бот для отслеживания "Гунов" (Goon Squad) в Escape from Tarkov.
 
-Парсит два сайта:
+Парсит четыре сайта (все — режим PvE):
 1. https://www.tarkov-goon-tracker.com/pve
 2. https://www.goon-tracker.com/pvetracker
+3. https://tarkovbot.eu/goonstracker
+4. https://eft.su/goons
 
-Оба сайта помечают время своих записей таймзоной (первый — "z"/UTC,
-второй — "PST"), поэтому бот конвертирует их во время МСК (UTC+3).
+Каждый сайт по-своему обозначает время (или не обозначает вовсе), поэтому
+бот конвертирует/вычисляет всё в единое время МСК и единый формат "X назад":
+- tarkov-goon-tracker.com помечает время суффиксом "z" (UTC)
+- goon-tracker.com подписывает время как "PST" (UTC-8)
+- tarkovbot.eu не указывает таймзону вообще, но даёт относительное "X ago" —
+  бот использует его, чтобы вычислить абсолютное время не завясящим от
+  таймзоны сайта способом
+- eft.su не указывает таймзону явно, но это русскоязычный сайт для русской
+  аудитории — время на нём принимается как уже указанное в МСК
 
 Команда в Discord: !гуны
 
@@ -43,6 +52,8 @@ HEADERS = {
 URLS = {
     "tarkov_goon_tracker": "https://www.tarkov-goon-tracker.com/pve",
     "goon_tracker": "https://www.goon-tracker.com/pvetracker",
+    "tarkovbot_eu": "https://tarkovbot.eu/goonstracker",
+    "eft_su": "https://eft.su/goons",
 }
 
 MSK = timezone(timedelta(hours=3), name="MSK")
@@ -54,6 +65,13 @@ MAP_NAMES_RU = {
     "shoreline": "Берег",
     "woods": "Лес",
     "lighthouse": "Маяк",
+}
+
+# Сокращения русских месяцев, которые использует eft.su ("07 авг., 13:07").
+# Отсортированы по длине при поиске, чтобы не перепутать "мар" и "мая".
+RU_MONTHS = {
+    "янв": 1, "февр": 2, "мар": 3, "апр": 4, "ма": 5, "июн": 6, "июл": 7,
+    "авг": 8, "сент": 9, "сен": 9, "окт": 10, "нояб": 11, "дек": 12,
 }
 
 
@@ -85,6 +103,50 @@ def humanize_ago(dt: datetime) -> str:
     if minutes > 0:
         return f"{minutes} мин. назад"
     return "только что"
+
+
+def parse_relative_ago(text: str) -> timedelta | None:
+    """Парсит английскую фразу вида "8 hours ago" / "3 days ago" / "just now"
+    в timedelta. Используется, когда сайт даёт относительное время, но не
+    указывает свою таймзону явно (так проще, чем гадать про таймзону сайта)."""
+    text = text.strip().lower()
+    if "just now" in text:
+        return timedelta(0)
+    m = re.match(r"(\d+)\s*(second|minute|hour|day|week)s?\s*ago", text)
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit_seconds = {
+        "second": 1,
+        "minute": 60,
+        "hour": 3600,
+        "day": 86400,
+        "week": 604800,
+    }[m.group(2)]
+    return timedelta(seconds=n * unit_seconds)
+
+
+def parse_ru_date(day: str, month_token: str, hour: str, minute: str) -> datetime | None:
+    """Парсит русскую дату без года вида "07 авг., 13:07" (eft.su).
+    Год не указан на сайте — берём текущий, а если получилось "в будущем"
+    (запись явно с прошлого года), откатываем на год назад."""
+    token = month_token.rstrip(".").lower()
+    month = None
+    for prefix in sorted(RU_MONTHS, key=len, reverse=True):
+        if token.startswith(prefix):
+            month = RU_MONTHS[prefix]
+            break
+    if month is None:
+        return None
+
+    now_msk = datetime.now(MSK)
+    try:
+        dt = datetime(now_msk.year, month, int(day), int(hour), int(minute), tzinfo=MSK)
+    except ValueError:
+        return None
+    if dt > now_msk + timedelta(days=1):
+        dt = dt.replace(year=now_msk.year - 1)
+    return dt
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +275,103 @@ def parse_goon_tracker(html: str) -> dict:
     }
 
 
+def parse_tarkovbot_eu(html: str) -> dict:
+    """
+    https://tarkovbot.eu/goonstracker
+
+    В шапке страницы блок "LAST REPORT" содержит по одной карточке на
+    каждый режим (PVP/PVE/SEASON), например:
+        Lighthouse (PVE)
+        07.08.2026 15:15:59
+        Reported by Err0rCZE
+        8 hours ago
+    Сайт не указывает свою таймзону, зато даёт готовое "X ago" — используем
+    именно его, чтобы посчитать время независимо от таймзоны сайта.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+
+    # Ограничиваем поиск шапкой, чтобы не зацепить более старую запись
+    # из "Goons Location History" ниже на странице.
+    section_match = re.search(r"LAST REPORT(.*?)Goons Location History", text, re.IGNORECASE | re.DOTALL)
+    section = section_match.group(1) if section_match else text
+
+    map_name = None
+    reporter = None
+    time_msk = None
+    relative = None
+
+    m = re.search(
+        r"([A-Za-z]+)\s*\(PVE\)\s*\d{2}\.\d{2}\.\d{4}\s*\d{2}:\d{2}:\d{2}\s*"
+        r"Reported by\s*(\S+)\s*((?:\d+\s+\w+\s+ago)|just now)",
+        section,
+        re.IGNORECASE,
+    )
+    if m:
+        map_name = m.group(1)
+        reporter = m.group(2)
+        delta = parse_relative_ago(m.group(3))
+        if delta is not None:
+            dt = datetime.now(UTC) - delta
+            time_msk = to_msk_str(dt)
+            relative = humanize_ago(dt)
+
+    extra_parts = []
+    if reporter:
+        extra_parts.append(f"Репортер: {reporter}")
+    if relative:
+        extra_parts.append(relative)
+
+    return {
+        "source": "TarkovBOT.eu (PvE)",
+        "map": translate_map(map_name),
+        "time_msk": time_msk,
+        "extra": "\n".join(extra_parts) if extra_parts else None,
+        "url": URLS["tarkovbot_eu"],
+    }
+
+
+def parse_eft_su(html: str) -> dict:
+    """
+    https://eft.su/goons
+
+    Показывает отдельно последнее появление в PVP и в PVE, нам нужен только
+    PVE-блок. Ссылка на карту вида <a href="/m/lighthouse">...</a>, дата в
+    самом тексте ссылки без года: "07 авг., 13:07". Сайт русскоязычный —
+    принимаем его время как уже указанное в МСК.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    map_name = None
+    time_msk = None
+    relative = None
+
+    for a in soup.find_all("a", href=re.compile(r"/m/[a-z\-]+", re.IGNORECASE)):
+        text = a.get_text(" ", strip=True)
+        if "PVE" not in text.upper():
+            continue
+
+        href_match = re.search(r"/m/([a-z\-]+)", a["href"], re.IGNORECASE)
+        map_name = href_match.group(1) if href_match else None
+
+        date_match = re.search(r"(\d{1,2})\s+([а-яА-Я]+)\.?,?\s+(\d{2}):(\d{2})", text)
+        if date_match:
+            day, month_tok, hh, mm = date_match.groups()
+            dt = parse_ru_date(day, month_tok, hh, mm)
+            if dt:
+                time_msk = to_msk_str(dt)
+                relative = humanize_ago(dt)
+        break
+
+    return {
+        "source": "EFT.SU (PvE)",
+        "map": translate_map(map_name),
+        "time_msk": time_msk,
+        "extra": relative,
+        "url": URLS["eft_su"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Discord-бот
 # ---------------------------------------------------------------------------
@@ -244,12 +403,14 @@ def fmt_field(map_name, time_msk, extra=None):
 @bot.command(name="гуны")
 @commands.cooldown(1, 15, commands.BucketType.guild)  # не чаще раза в 15 сек на сервер, чтобы не спамить сайты
 async def goons(ctx: commands.Context):
-    """Показывает последние замеченные локации Гунов (PvE) с двух трекеров, время в МСК."""
+    """Показывает последние замеченные локации Гунов (PvE) с четырёх трекеров, время в МСК."""
     async with ctx.typing():
         async with aiohttp.ClientSession() as session:
-            html_tgt, html_gt = await asyncio.gather(
+            html_tgt, html_gt, html_tbeu, html_eft = await asyncio.gather(
                 fetch_html(session, URLS["tarkov_goon_tracker"]),
                 fetch_html(session, URLS["goon_tracker"]),
+                fetch_html(session, URLS["tarkovbot_eu"]),
+                fetch_html(session, URLS["eft_su"]),
             )
 
         embed = discord.Embed(
@@ -257,27 +418,23 @@ async def goons(ctx: commands.Context):
             color=discord.Color.dark_red(),
         )
 
-        # 1. tarkov-goon-tracker.com
-        if html_tgt:
-            d = parse_tarkov_goon_tracker(html_tgt)
-            embed.add_field(
-                name=f"📍 {d['source']}",
-                value=fmt_field(d["map"], d["time_msk"], d["extra"]),
-                inline=False,
-            )
-        else:
-            embed.add_field(name="📍 Tarkov Goon Tracker (PvE)", value="⚠️ Сайт недоступен", inline=False)
+        sources = [
+            (html_tgt, parse_tarkov_goon_tracker, "Tarkov Goon Tracker (PvE)"),
+            (html_gt, parse_goon_tracker, "Goon-Tracker.com (PvE)"),
+            (html_tbeu, parse_tarkovbot_eu, "TarkovBOT.eu (PvE)"),
+            (html_eft, parse_eft_su, "EFT.SU (PvE)"),
+        ]
 
-        # 2. goon-tracker.com
-        if html_gt:
-            d = parse_goon_tracker(html_gt)
-            embed.add_field(
-                name=f"📍 {d['source']}",
-                value=fmt_field(d["map"], d["time_msk"], d["extra"]),
-                inline=False,
-            )
-        else:
-            embed.add_field(name="📍 Goon-Tracker.com (PvE)", value="⚠️ Сайт недоступен", inline=False)
+        for html, parser, fallback_name in sources:
+            if html:
+                d = parser(html)
+                embed.add_field(
+                    name=f"📍 {d['source']}",
+                    value=fmt_field(d["map"], d["time_msk"], d["extra"]),
+                    inline=False,
+                )
+            else:
+                embed.add_field(name=f"📍 {fallback_name}", value="⚠️ Сайт недоступен", inline=False)
 
         embed.set_footer(text="Данные собраны с публичных коммьюнити-трекеров, могут не совпадать между источниками")
 
