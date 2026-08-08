@@ -10,7 +10,9 @@ Discord-бот для отслеживания "Гунов" (Goon Squad) в Esca
 Каждый сайт по-своему обозначает время (или не обозначает вовсе), поэтому
 бот конвертирует/вычисляет всё в единое время МСК и единый формат "X назад":
 - tarkov-goon-tracker.com помечает время суффиксом "z" (UTC)
-- goon-tracker.com подписывает время как "PST" (UTC-8)
+- goon-tracker.com подписывает время как "PST", но сайт не обновляет ярлык
+  на "PDT" летом — бот использует настоящую таймзону America/Los_Angeles
+  с автоматическим учётом перехода на летнее/зимнее время, а не жёсткий UTC-8
 - tarkovbot.eu не указывает таймзону вообще, но даёт относительное "X ago" —
   бот использует его, чтобы вычислить абсолютное время не завясящим от
   таймзоны сайта способом
@@ -32,6 +34,7 @@ import re
 import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
@@ -58,7 +61,10 @@ URLS = {
 
 MSK = timezone(timedelta(hours=3), name="MSK")
 UTC = timezone.utc
-PST = timezone(timedelta(hours=-8), name="PST")  # сайт goon-tracker.com жёстко подписывает время как PST
+# Сайт goon-tracker.com всегда пишет "PST" в подписи, даже когда в США
+# летнее время (PDT, UTC-7) — используем настоящую таймзону с DST-правилами,
+# чтобы не промахиваться на час летом.
+PACIFIC = ZoneInfo("America/Los_Angeles")
 
 MAP_NAMES_RU = {
     "customs": "Таможня",
@@ -259,7 +265,7 @@ def parse_goon_tracker(html: str) -> dict:
     )
     if time_match:
         try:
-            dt = datetime.strptime(time_match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=PST)
+            dt = datetime.strptime(time_match.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=PACIFIC)
             time_msk = to_msk_str(dt)
         except ValueError:
             dt = None
