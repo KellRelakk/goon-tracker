@@ -55,6 +55,24 @@ def to_msk_str(dt: datetime) -> str:
     return dt.astimezone(MSK).strftime("%d.%m.%Y %H:%M МСК")
 
 
+def humanize_ago(dt: datetime) -> str:
+    """Считает, сколько времени прошло с момента dt, и возвращает строку вида
+    "5 мин. назад" / "2 ч. назад" / "1 дн. назад"."""
+    delta = datetime.now(UTC) - dt.astimezone(UTC)
+    seconds = max(int(delta.total_seconds()), 0)
+    minutes = seconds // 60
+    hours = minutes // 60
+    days = hours // 24
+
+    if days > 0:
+        return f"{days} дн. назад"
+    if hours > 0:
+        return f"{hours} ч. назад"
+    if minutes > 0:
+        return f"{minutes} мин. назад"
+    return "только что"
+
+
 # ---------------------------------------------------------------------------
 # Загрузка страниц
 # ---------------------------------------------------------------------------
@@ -89,6 +107,7 @@ def parse_tarkov_goon_tracker(html: str) -> dict:
     map_name = None
     time_msk = None
     reporter = None
+    relative = None
 
     table = soup.find("table")
     if table:
@@ -104,6 +123,7 @@ def parse_tarkov_goon_tracker(html: str) -> dict:
                     try:
                         dt = datetime.strptime(m.group(1), "%b %d, %Y %I:%M %p").replace(tzinfo=UTC)
                         time_msk = to_msk_str(dt)
+                        relative = humanize_ago(dt)
                     except ValueError:
                         pass
             if len(cells) >= 3:
@@ -116,11 +136,17 @@ def parse_tarkov_goon_tracker(html: str) -> dict:
         if m:
             map_name = m.group(1).strip()
 
+    extra_parts = []
+    if reporter:
+        extra_parts.append(f"Репортер: {reporter}")
+    if relative:
+        extra_parts.append(relative)
+
     return {
         "source": "Tarkov Goon Tracker (PvE)",
         "map": map_name,
         "time_msk": time_msk,
-        "extra": f"Репортер: {reporter}" if reporter else None,
+        "extra": "\n".join(extra_parts) if extra_parts else None,
         "url": URLS["tarkov_goon_tracker"],
     }
 
