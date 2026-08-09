@@ -305,7 +305,7 @@ def parse_tarkovbot_eu(html: str) -> dict:
 
     m = re.search(
         r"([A-Za-z]+)\s*\(PVE\)\s*\d{2}\.\d{2}\.\d{4}\s*\d{2}:\d{2}:\d{2}\s*"
-        r"Reported by\s*\S+\s*((?:\d+\s+\w+\s+ago)|just now)",
+        r"Reported by\s*.*?\s*((?:\d+\s+\w+\s+ago)|just now)",
         section,
         re.IGNORECASE,
     )
